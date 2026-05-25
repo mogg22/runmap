@@ -1,0 +1,73 @@
+.run-map {
+  position: fixed;
+  inset: 0;
+  background: #080808;
+  overflow: hidden;
+  cursor: crosshair;
+}
+
+.map-layer {
+  position: absolute;
+  inset: 0;
+  will-change: transform;
+}
+
+.route-canvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.text-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.name-block {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-family: 'Courier New', monospace;
+  white-space: nowrap;
+  pointer-events: none;
+  will-change: transform;
+  letter-spacing: 0.04em;
+  user-select: none;
+}
+
+/* 파티클 + 트레일 — 항상 최상단, 줌 밖 */
+.particle-canvas {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 50;
+  width: 100%;
+  height: 100%;
+}
+
+.empty-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-family: 'Courier New', monospace;
+  font-size: 14px;
+  color: #333;
+  text-align: center;
+  line-height: 2;
+  pointer-events: none;
+}
+
+.zoom-indicator {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+  color: #555;
+  pointer-events: none;
+  letter-spacing: 0.05em;
+  z-index: 60;
+}
