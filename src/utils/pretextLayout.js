@@ -19,20 +19,36 @@ function getPrepSeg(text, font) {
   return cache.get(key);
 }
 
-// 이름 텍스트의 실제 너비 계산 (DOM 접근 없음)
 export function measureName(name, fontSize) {
+  // fontSize가 비정상이면 폴백
+  if (!fontSize || fontSize <= 0 || isNaN(fontSize)) {
+    return { width: name.length * 8, height: 14 };
+  }
+
   const font = `${fontSize}px "Courier New", monospace`;
   try {
     const prep = getPrepSeg(name, font);
     const { maxLineWidth } = measureLineStats(prep, 9999);
-    return { width: maxLineWidth + 4, height: fontSize * 1.3 };
+
+    // maxLineWidth가 0이거나 비정상이면 폴백
+    if (!maxLineWidth || maxLineWidth <= 0 || maxLineWidth > 2000) {
+      return { width: name.length * fontSize * 0.6, height: fontSize * 1.3 };
+    }
+
+    return {
+      width: maxLineWidth + 4,
+      height: fontSize * 1.4,
+    };
   } catch {
-    return { width: name.length * fontSize * 0.6, height: fontSize * 1.3 };
+    // Pretext 실패 시 문자 수 기반 추정
+    return {
+      width: name.length * fontSize * 0.6,
+      height: fontSize * 1.4,
+    };
   }
 }
 
-// 텍스트 풀 warmup
-export function warmupNames(names, fontSizes = [10, 12, 14, 16, 18, 20, 22, 24]) {
+export function warmupNames(names, fontSizes = [8, 10, 12, 14, 16, 20, 24, 32, 40]) {
   let count = 0;
   for (const name of names) {
     for (const size of fontSizes) {

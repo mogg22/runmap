@@ -6,17 +6,18 @@ function computeBlockFn(block, mouse, zoom) {
   const dy = block.y - mouse.y;
   const dist = Math.sqrt(dx * dx + dy * dy);
 
-  // 반발 반경을 줌에 반비례로 조절
-  // zoom 1 → 원래 반경, zoom 2 → 절반 반경, zoom 0.5 → 두 배 반경
-  const baseStrength = block.repulsionStrength ?? 60;
+  const baseStrength = block.repulsionStrength ?? 40;
   const scaledStrength = baseStrength / zoom;
-  const radius = scaledStrength + 80 / zoom;
+
+  // ← 반발 반경 축소: +80 → +30
+  const radius = scaledStrength + 30 / zoom;
 
   let repelX = 0, repelY = 0;
   if (dist < radius && dist > 0) {
     const force = (1 - dist / radius) ** 2;
-    repelX = (dx / dist) * force * scaledStrength;
-    repelY = (dy / dist) * force * scaledStrength;
+    // ← force 강도 0.5배로 축소
+    repelX = (dx / dist) * force * scaledStrength * 0.5;
+    repelY = (dy / dist) * force * scaledStrength * 0.5;
   }
 
   const targetX = block.baseX + repelX;
@@ -38,15 +39,15 @@ function computeBlockFn(block, mouse, zoom) {
 }
 
 function applyShockwaveFn(blocks, cx, cy, zoom, radius = 200) {
-  // 충격파 범위도 줌에 반비례
-  const scaledRadius = radius / zoom;
+  // ← 충격파 범위도 줄임
+  const scaledRadius = (radius * 0.6) / zoom;
 
   return blocks.map((b) => {
     const dx = b.x - cx;
     const dy = b.y - cy;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < scaledRadius && dist > 0) {
-      const force = (1 - dist / scaledRadius) * 14;
+      const force = (1 - dist / scaledRadius) * 8;  // 14 → 8
       return {
         ...b,
         velX: (b.velX ?? 0) + (dx / dist) * force,
@@ -59,15 +60,10 @@ function applyShockwaveFn(blocks, cx, cy, zoom, radius = 200) {
 
 export function usePhysics() {
   const mouseRef = useRef({ x: -9999, y: -9999 });
-  const zoomRef  = useRef(1);  // ← 줌 값 공유용
+  const zoomRef  = useRef(1);
 
-  function updateMouse(x, y) {
-    mouseRef.current = { x, y };
-  }
-
-  function updateZoom(z) {
-    zoomRef.current = z;
-  }
+  function updateMouse(x, y) { mouseRef.current = { x, y }; }
+  function updateZoom(z)     { zoomRef.current = z; }
 
   function computeBlock(block) {
     return computeBlockFn(block, mouseRef.current, zoomRef.current);
