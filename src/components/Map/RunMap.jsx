@@ -2,100 +2,240 @@ import { useEffect, useRef, useCallback, useState } from "react";
 import { useRunners } from "../../hooks/useRunners";
 import { useHeatmap } from "../../hooks/useHeatmap";
 import { usePhysics } from "../../hooks/usePhysics";
-import { densityToBlockParams } from "../../utils/heatmap";
-import { projectPath, computeBbox } from "../../utils/projection";
+import { useFillDensity } from "../../hooks/useFillDensity";
+import { projectPath, projectPathKakao } from "../../utils/projection";
 import { measureName, warmupNames } from "../../utils/pretextLayout";
 import { ParticleSystem } from "../../utils/particleSystem";
-import { animatePath } from "../../utils/pathAnimator";
 import { detectOverlap } from "../../utils/overlapDetector";
+import { isPointInPolygon, simplifyPath } from "../../utils/polygonFill";
+import { runnersStore } from "../../store/runnersStore";
 import "./RunMap.css";
 
-const GRID_SIZE = 40;
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
-function createCellBlocks(cell, runners, bbox, dominance) {
-  const cellRunners = runners.filter((r) =>
-    r.points.some((pt) => {
-      const col = Math.floor(
-        ((pt.lon - bbox.minLon) / (bbox.maxLon - bbox.minLon)) * GRID_SIZE
-      );
-      const row = Math.floor(
-        ((bbox.maxLat - pt.lat) / (bbox.maxLat - bbox.minLat)) * GRID_SIZE
-      );
-      return col === cell.col && row === cell.row;
-    })
-  );
+function getPolygonArea(points) {
+  let area = 0;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    area += points[j].x * points[i].y - points[i].x * points[j].y;
+  }
+  return Math.abs(area / 2);
+}
 
-  if (cellRunners.length === 0) return [];
+function getRunnerEmphasis(rank, total) {
+  if (rank === 0) {
+    return { rank, fontScale: 1.45, fontWeight: 850, opacity: 0.95, glow: 9, routeWidth: 3.2, routeAlpha: 0.9 };
+  }
+  if (rank === 1) {
+    return { rank, fontScale: 1.25, fontWeight: 760, opacity: 0.86, glow: 5, routeWidth: 2.4, routeAlpha: 0.78 };
+  }
+  if (rank === 2) {
+    return { rank, fontScale: 1.12, fontWeight: 680, opacity: 0.8, glow: 3, routeWidth: 1.9, routeAlpha: 0.68 };
+  }
 
-  // 셀당 1개만 — 가장 지배력 높은 러너 선택
-  const dominant = cellRunners.reduce((best, r) => {
-    const d = dominance?.[r.id] ?? 0;
-    return d > (dominance?.[best.id] ?? 0) ? r : best;
-  }, cellRunners[0]);
+  const fade = total > 1 ? rank / (total - 1) : 0;
+  return {
+    rank,
+    fontScale: clamp(1 - fade * 0.14, 0.86, 1),
+    fontWeight: 520,
+    opacity: clamp(0.72 - fade * 0.18, 0.48, 0.72),
+    glow: 0,
+    routeWidth: clamp(1.45 - fade * 0.35, 1, 1.45),
+    routeAlpha: clamp(0.55 - fade * 0.18, 0.34, 0.55),
+  };
+}
 
-  const name = dominant.name;
-  const runnerDominance = dominance?.[dominant.id] ?? 0;
-  const params = densityToBlockParams(cell.density, runnerDominance);
+function buildRunnerEmphasis(projectedEntries) {
+  const ranked = projectedEntries
+    .map(({ runner, pts }) => ({
+      id: runner.id,
+      area: pts.length >= 3 ? getPolygonArea(pts) : 0,
+    }))
+    .sort((a, b) => b.area - a.area);
 
-  const { width, height } = measureName(name, params.fontSize);
+  const emphasisById = new Map();
+  ranked.forEach(({ id }, rank) => {
+    emphasisById.set(id, getRunnerEmphasis(rank, ranked.length));
+  });
 
-  // scatter: 셀 중심에서 약간 랜덤 오프셋
-  const offsetX = (Math.random() - 0.5) * cell.cellW * params.scatterScale;
-  const offsetY = (Math.random() - 0.5) * cell.cellH * params.scatterScale;
-  const bx = cell.x + offsetX;
-  const by = cell.y + offsetY;
+  return emphasisById;
+}
 
-  return [{
-    id: `${cell.row}-${cell.col}`,
-    text: name,
-    color: dominant.color,
-    baseX: bx, baseY: by,
-    x: bx, y: by,
-    velX: 0, velY: 0,
-    fontSize: params.fontSize,
+function makeBlock(runner, index, x, y, fontSize, textWidth, emphasis) {
+  return {
+    id: `fill-${runner.id}-${index}`,
+    text: runner.name,
+    color: runner.color,
+    rank: emphasis.rank,
+    baseX: x,
+    baseY: y,
+    x,
+    y,
+    velX: 0,
+    velY: 0,
+    fontSize,
+    textWidth,
+    fontWeight: emphasis.fontWeight,
+    textShadow: emphasis.glow > 0 ? `0 0 ${emphasis.glow}px ${runner.color}` : "none",
     opacity: 0,
-    targetOpacity: params.opacity,
-    width, height,
-    repulsionStrength: params.repulsionStrength,
-    vibration: params.vibration,
-  }];
+    targetOpacity: emphasis.opacity,
+    repulsionStrength: 30,
+    vibration: 0,
+  };
+}
+
+function createFillBlocks(runner, projectedPoints, fillDensity, zoom, emphasis) {
+  if (projectedPoints.length < 3) return [];
+
+  const tolerance = 0.05 / Math.max(zoom, 0.1);
+  const polygon = simplifyPath(projectedPoints, tolerance);
+  if (polygon.length < 3) return [];
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const p of polygon) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+
+  const width = maxX - minX;
+  const height = maxY - minY;
+  const area = getPolygonArea(polygon);
+  const areaFontSize = clamp(Math.sqrt(area) * 0.03, 4, 20);
+  const widthFontSize = clamp(width / Math.max(runner.name.length, 1), 4, areaFontSize);
+  const fontSize = Math.min(
+    areaFontSize * emphasis.fontScale,
+    widthFontSize,
+    Math.max(4, fillDensity * 0.7 * emphasis.fontScale),
+  );
+  const measured = measureName(runner.name, fontSize);
+  const textWidth = measured.width ?? runner.name.length * fontSize * 0.6;
+  const stepX = Math.max(textWidth * 0.9, fontSize * 1.2);
+  const stepY = Math.max(fontSize * 0.9, 4);
+
+  if (width < stepX || height < stepY * 1.5) {
+    const blocks = [];
+    let dist = 0;
+    for (let i = 1; i < projectedPoints.length; i++) {
+      const prev = projectedPoints[i - 1];
+      const curr = projectedPoints[i];
+      dist += Math.hypot(curr.x - prev.x, curr.y - prev.y);
+      if (dist >= stepX) {
+        dist = 0;
+        blocks.push(makeBlock(runner, i, curr.x, curr.y, fontSize, textWidth, emphasis));
+      }
+    }
+    return blocks;
+  }
+
+  const blocks = [];
+  let index = 0;
+  let row = 0;
+  for (let y = minY + stepY / 2; y < maxY; y += stepY) {
+    const rowOffset = row % 2 === 0 ? 0 : stepX * 0.45;
+    for (let x = minX + textWidth / 2 + rowOffset; x < maxX - textWidth / 2; x += stepX) {
+      const leftX = x - textWidth / 2;
+      const rightX = x + textWidth / 2;
+      if (
+        isPointInPolygon(x, y, polygon) &&
+        isPointInPolygon(leftX, y, polygon) &&
+        isPointInPolygon(rightX, y, polygon)
+      ) {
+        blocks.push(makeBlock(runner, index, x, y, fontSize, textWidth, emphasis));
+        index++;
+      }
+    }
+    row++;
+  }
+
+  return blocks;
+}
+
+function fitRunnerBounds(map, runner) {
+  if (!runner.points?.length) return;
+
+  const bounds =
+    new window.kakao.maps.LatLngBounds();
+
+  runner.points.forEach((p) => {
+    bounds.extend(
+      new window.kakao.maps.LatLng(
+        p.lat,
+        p.lon
+      )
+    );
+  });
+
+  map.setBounds(bounds);
 }
 
 export function RunMap() {
-  const containerRef      = useRef(null);
-  const routeCanvasRef    = useRef(null);
-  const animCanvasRef     = useRef(null);
+  const containerRef = useRef(null);
+  const routeCanvasRef = useRef(null);
   const particleCanvasRef = useRef(null);
-  const textLayerRef      = useRef(null);
-  const nodesRef          = useRef([]);
-  const blocksRef         = useRef([]);
-  const rafRef            = useRef(null);
-  const particleSysRef    = useRef(null);
-  const prevRunnersRef    = useRef([]);
-  const drawAllRoutesRef  = useRef(null);
-
-  const zoomRef      = useRef(1);
-  const panRef       = useRef({ x: 0, y: 0 });
-  const isPanningRef = useRef(false);
-  const lastPanRef   = useRef({ x: 0, y: 0 });
+  const mapRef = useRef(null);
+  const textLayerRef = useRef(null);
+  const nodesRef = useRef([]);
+  const blocksRef = useRef([]);
+  const rafRef = useRef(null);
+  const particleSysRef = useRef(null);
+  const prevRunnersRef = useRef([]);
+  const drawAllRoutesRef = useRef(null);
+  const rebuildBlocksRef = useRef(null);
+  const kakaoMapRef = useRef(null);
+  const zoomRef = useRef(1);
+  const skipNextClickRef = useRef(false);
+  const overlayDragRef = useRef({
+    active: false,
+    moved: false,
+    startX: 0,
+    startY: 0,
+    dx: 0,
+    dy: 0,
+  });
 
   const [zoom, setZoom] = useState(1);
-  const [pan,  setPan]  = useState({ x: 0, y: 0 });
   const [size, setSize] = useState({ w: 0, h: 0 });
+  const [densityDisplay, setDensityDisplay] = useState(null);
+  const densityTimerRef = useRef(null);
+  const [topRunners, setTopRunners] = useState([]);
 
   const runners = useRunners();
-  const { bbox, cells, dominance } = useHeatmap(runners, size.w, size.h);
+  const { bbox } = useHeatmap(runners, size.w, size.h);
+  const fillDensity = useFillDensity();
   const { updateMouse, updateZoom, computeBlock, applyShockwave } = usePhysics();
 
-  const computeBlockRef   = useRef(computeBlock);
+  const computeBlockRef = useRef(computeBlock);
   const applyShockwaveRef = useRef(applyShockwave);
-  useEffect(() => { computeBlockRef.current   = computeBlock;   }, [computeBlock]);
+  useEffect(() => { computeBlockRef.current = computeBlock; }, [computeBlock]);
   useEffect(() => { applyShockwaveRef.current = applyShockwave; }, [applyShockwave]);
 
-  // ── 1. 컨테이너 크기 감지 ────────────────────────────
+  const setOverlayTransform = useCallback(({ dx = 0, dy = 0, scale = 1, originX = 0, originY = 0 } = {}) => {
+    const transform = dx === 0 && dy === 0 && scale === 1
+      ? ""
+      : `translate(${dx}px, ${dy}px) scale(${scale})`;
+    const origin = `${originX}px ${originY}px`;
+
+    for (const node of [routeCanvasRef.current, textLayerRef.current]) {
+      if (!node) continue;
+      node.style.transform = transform;
+      node.style.transformOrigin = origin;
+    }
+  }, []);
+
+  const syncMapOverlays = useCallback(({ animateText = false } = {}) => {
+    setOverlayTransform();
+    drawAllRoutesRef.current?.();
+    rebuildBlocksRef.current?.({ animate: animateText });
+  }, [setOverlayTransform]);
+
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+
     const ro = new ResizeObserver(([entry]) => {
       const { width, height } = entry.contentRect;
       setSize({ w: Math.round(width), h: Math.round(height) });
@@ -104,11 +244,88 @@ export function RunMap() {
     return () => ro.disconnect();
   }, []);
 
-  // ── 2. 파티클 시스템 초기화 ──────────────────────────
+  useEffect(() => {
+    const el = mapRef.current;
+    if (!el || kakaoMapRef.current) return undefined;
+
+    let intervalId = null;
+    let map = null;
+    const handlers = [];
+    let redrawRaf = null;
+
+    const scheduleRedraw = ({ animateText = false } = {}) => {
+      if (redrawRaf) cancelAnimationFrame(redrawRaf);
+      redrawRaf = requestAnimationFrame(() => {
+        if (map) {
+          const nextZoom = 2 ** (5 - map.getLevel());
+          zoomRef.current = nextZoom;
+          updateZoom(nextZoom);
+          setZoom(nextZoom);
+        }
+        if (overlayDragRef.current.active) return;
+        syncMapOverlays({ animateText });
+      });
+    };
+
+    const init = () => {
+      if (!window.kakao?.maps || kakaoMapRef.current) return;
+
+      map = new window.kakao.maps.Map(el, {
+        center: new window.kakao.maps.LatLng(37.498, 126.845),
+        level: 5,
+      });
+
+      map.setDraggable(true);
+      map.setZoomable(true);
+      kakaoMapRef.current = map;
+
+      for (const eventName of ["center_changed", "zoom_changed", "bounds_changed", "drag", "dragend", "idle"]) {
+        const handler = () => scheduleRedraw();
+        window.kakao.maps.event.addListener(map, eventName, handler);
+        handlers.push([eventName, handler]);
+      }
+
+      const dragStartHandler = () => {
+        skipNextClickRef.current = true;
+      };
+      window.kakao.maps.event.addListener(map, "dragstart", dragStartHandler);
+      handlers.push(["dragstart", dragStartHandler]);
+
+      scheduleRedraw({ animateText: true });
+    };
+
+    if (window.kakao?.maps) {
+      init();
+    } else {
+      intervalId = setInterval(init, 100);
+    }
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+      if (redrawRaf) cancelAnimationFrame(redrawRaf);
+      if (map && window.kakao?.maps) {
+        handlers.forEach(([eventName, handler]) => {
+          window.kakao.maps.event.removeListener(map, eventName, handler);
+        });
+      }
+    };
+  }, [syncMapOverlays, updateZoom]);
+
+  useEffect(() => {
+    const map = kakaoMapRef.current;
+    if (!map || runners.length === 0) return;
+
+    fitRunnerBounds(
+      map,
+      runners[runners.length - 1]
+    );
+  }, [runners]);
+
   useEffect(() => {
     const canvas = particleCanvasRef.current;
-    if (!canvas || size.w === 0) return;
-    canvas.width  = size.w;
+    if (!canvas || size.w === 0) return undefined;
+
+    canvas.width = size.w;
     canvas.height = size.h;
 
     if (!particleSysRef.current) {
@@ -124,270 +341,335 @@ export function RunMap() {
     };
   }, [size]);
 
-  // ── 3. 스크롤 줌 ─────────────────────────────────────
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const onWheel = (e) => {
-      e.preventDefault();
-      const factor   = e.deltaY > 0 ? 0.9 : 1.1;
-      const rect     = el.getBoundingClientRect();
-      const mx       = e.clientX - rect.left;
-      const my       = e.clientY - rect.top;
-      const prevZoom = zoomRef.current;
-      const prevPan  = panRef.current;
-      const nextZoom = Math.max(0.4, Math.min(10, prevZoom * factor));
-      const nextPanX = mx - (mx - prevPan.x) * (nextZoom / prevZoom);
-      const nextPanY = my - (my - prevPan.y) * (nextZoom / prevZoom);
-      zoomRef.current = nextZoom;
-      panRef.current  = { x: nextPanX, y: nextPanY };
-      updateZoom(nextZoom);
-      setZoom(nextZoom);
-      setPan({ x: nextPanX, y: nextPanY });
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, [updateZoom]);
-
-  // ── 4. Pretext warmup ────────────────────────────────
   useEffect(() => {
     if (runners.length > 0) warmupNames(runners.map((r) => r.name));
   }, [runners]);
 
-  // ── 5. drawAllRoutes — 선언을 새 러너 감지보다 앞에 ──
   const drawAllRoutes = useCallback(() => {
     const canvas = routeCanvasRef.current;
-    if (!canvas || !bbox || size.w === 0) return;
-    canvas.width  = size.w;
+    const kakaoMap = kakaoMapRef.current;
+    if (!canvas || size.w === 0) return;
+
+    canvas.width = size.w;
     canvas.height = size.h;
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, size.w, size.h);
-    for (const runner of runners) {
-      const pts = projectPath(runner.points, bbox, size.w, size.h);
-      if (pts.length < 2) continue;
+
+    const projectedEntries = runners
+      .map((runner) => ({
+        runner,
+        pts: kakaoMap && window.kakao?.maps
+          ? projectPathKakao(runner.points, kakaoMap)
+          : bbox ? projectPath(runner.points, bbox, size.w, size.h) : [],
+      }))
+      .filter(({ pts }) => pts.length >= 2);
+    const emphasisById = buildRunnerEmphasis(projectedEntries);
+
+    setTopRunners(getTopRunnerRanking(projectedEntries));
+
+    function getTopRunnerRanking(projectedEntries) {
+      return projectedEntries
+        .map(({ runner, pts }) => ({
+          id: runner.id,
+          name: runner.name,
+          color: runner.color,
+          area: pts.length >= 3 ? getPolygonArea(pts) : 0,
+        }))
+        .sort((a, b) => b.area - a.area)
+        .slice(0, 3);
+    }
+
+    for (const { runner, pts } of projectedEntries) {
+      const emphasis = emphasisById.get(runner.id) ?? getRunnerEmphasis(0, 1);
       ctx.beginPath();
       ctx.moveTo(pts[0].x, pts[0].y);
       for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-      ctx.strokeStyle  = runner.color;
-      ctx.lineWidth    = 1;
-      ctx.globalAlpha  = 0.18;
+      ctx.strokeStyle = runner.color;
+      ctx.lineWidth = emphasis.routeWidth;
+      ctx.globalAlpha = emphasis.routeAlpha;
       ctx.stroke();
     }
   }, [runners, bbox, size]);
 
-  // ref에 항상 최신 함수 저장
   useEffect(() => { drawAllRoutesRef.current = drawAllRoutes; }, [drawAllRoutes]);
-
-  // runners/bbox/size 변할 때마다 경로 다시 그리기
   useEffect(() => { drawAllRoutes(); }, [drawAllRoutes]);
 
-  // ── 6. 새 러너 감지 → 드로잉 애니메이션 + 파티클 ────
+  const rebuildBlocks = useCallback(({ animate = true } = {}) => {
+    const layer = textLayerRef.current;
+    const kakaoMap = kakaoMapRef.current;
+    if (size.w === 0 || !layer || runners.length === 0) return;
+
+    nodesRef.current.forEach((n) => n.remove());
+    nodesRef.current = [];
+
+    const allBlocks = [];
+    const currentZoom = zoomRef.current;
+    const effectiveDensity = fillDensity / Math.max(currentZoom, 0.1);
+
+    const projectedEntries = runners
+      .map((runner) => ({
+        runner,
+        pts: kakaoMap && window.kakao?.maps
+          ? projectPathKakao(runner.points, kakaoMap)
+          : bbox ? projectPath(runner.points, bbox, size.w, size.h) : [],
+      }))
+      .filter(({ pts }) => pts.length >= 2);
+    const emphasisById = buildRunnerEmphasis(projectedEntries);
+
+    for (const { runner, pts } of projectedEntries) {
+      const emphasis = emphasisById.get(runner.id) ?? getRunnerEmphasis(0, 1);
+      allBlocks.push(...createFillBlocks(runner, pts, effectiveDensity, currentZoom, emphasis));
+    }
+
+    blocksRef.current = allBlocks;
+
+    allBlocks.forEach((block) => {
+      const span = document.createElement("span");
+      span.className = "name-block";
+      span.textContent = block.text;
+      span.style.fontSize = `${block.fontSize}px`;
+      span.style.fontWeight = `${block.fontWeight}`;
+      span.style.color = block.color;
+      span.style.textShadow = block.textShadow;
+      span.style.opacity = animate ? "0" : `${block.targetOpacity}`;
+      span.style.transition = animate ? "opacity 0.4s ease" : "none";
+      span.style.transform = `translate(${block.x - block.textWidth / 2}px, ${block.y - block.fontSize / 2}px)`;
+      layer.appendChild(span);
+      nodesRef.current.push(span);
+      if (animate) {
+        setTimeout(() => { span.style.opacity = block.targetOpacity; }, Math.random() * 400);
+      }
+    });
+  }, [runners, bbox, size, fillDensity]);
+
+  useEffect(() => { rebuildBlocksRef.current = rebuildBlocks; }, [rebuildBlocks]);
+  useEffect(() => { rebuildBlocks(); }, [rebuildBlocks, zoom]);
+
   useEffect(() => {
-    if (!bbox || size.w === 0) return;
+    if (size.w === 0) return;
 
     const prev = prevRunnersRef.current;
-    const newRunners = runners.filter(
-      (r) => !prev.find((p) => p.id === r.id)
-    );
+    const newRunners = runners.filter((r) => !prev.find((p) => p.id === r.id));
 
     for (const newRunner of newRunners) {
-      const pts = projectPath(newRunner.points, bbox, size.w, size.h);
-      const animCtx = animCanvasRef.current?.getContext("2d");
+      if (!bbox) continue;
 
-      // 겹침 감지
-      const { hasOverlap, overlapKeys } = detectOverlap(
-        newRunner, prev, bbox
-      );
+      const pts = projectPath(newRunner.points, bbox, size.w, size.h);
+      const { hasOverlap, overlapKeys } = detectOverlap(newRunner, prev, bbox);
 
       if (hasOverlap && overlapKeys.length > 0) {
         const overlapPoints = pts.filter((_, i) => {
           const pt = newRunner.points[i];
           if (!pt) return false;
-          const col = Math.floor(
-            ((pt.lon - bbox.minLon) / (bbox.maxLon - bbox.minLon)) * 80
-          );
-          const row = Math.floor(
-            ((bbox.maxLat - pt.lat) / (bbox.maxLat - bbox.minLat)) * 80
-          );
+          const col = Math.floor(((pt.lon - bbox.minLon) / (bbox.maxLon - bbox.minLon)) * 80);
+          const row = Math.floor(((bbox.maxLat - pt.lat) / (bbox.maxLat - bbox.minLat)) * 80);
           return overlapKeys.includes(`${col}_${row}`);
         });
-        particleSysRef.current?.explodePath(
-          overlapPoints, prev, newRunner.color
-        );
+        particleSysRef.current?.explodePath(overlapPoints, prev, newRunner.color);
       }
+    }
 
-      // 경로 드로잉 애니메이션
-      if (animCtx) {
-        animCanvasRef.current.width  = size.w;
-        animCanvasRef.current.height = size.h;
-        animatePath(animCtx, pts, newRunner.color, 1800, () => {
-          drawAllRoutesRef.current?.();   // ref로 호출 — 선언 순서 무관
-        });
-      }
+    const latestRunner = newRunners.at(-1);
+
+    if (
+      latestRunner &&
+      kakaoMapRef.current &&
+      window.kakao?.maps
+    ) {
+      fitRunnerBounds(
+        kakaoMapRef.current,
+        latestRunner
+      );
     }
 
     prevRunnersRef.current = [...runners];
+    setTimeout(() => {
+      drawAllRoutesRef.current?.();
+      rebuildBlocksRef.current?.();
+    }, 200);
   }, [runners, bbox, size]);
 
-  // ── 7. 텍스트 블록 초기화 ────────────────────────────
-  useEffect(() => {
-    const layer = textLayerRef.current;
-    if (!bbox || cells.length === 0 || size.w === 0 || !layer) return;
-
-    nodesRef.current.forEach((n) => n.remove());
-    nodesRef.current = [];
-
-    const allBlocks = cells.flatMap((cell) =>
-      createCellBlocks(cell, runners, bbox, dominance)
-    );
-    blocksRef.current = allBlocks;
-
-    allBlocks.forEach((block) => {
-      const span = document.createElement("span");
-      span.className        = "name-block";
-      span.textContent      = block.text;
-      span.style.fontSize   = `${block.fontSize}px`;
-      span.style.color      = block.color;
-      span.style.opacity    = "0";
-      span.style.transition = "opacity 0.6s ease, text-shadow 0.3s ease";
-      span.style.transform  = `translate(${block.x}px, ${block.y}px)`;
-      layer.appendChild(span);
-      nodesRef.current.push(span);
-
-      // 모프 등장
-      const delay = Math.random() * 600;
-      setTimeout(() => {
-        span.style.opacity = block.targetOpacity;
-      }, delay);
-    });
-  }, [cells, runners, bbox, size, dominance]);
-
-  // ── 8. 물리 루프 + 글로우 ────────────────────────────
   useEffect(() => {
     const loop = () => {
-      blocksRef.current = blocksRef.current.map(
-        (block) => computeBlockRef.current(block)
-      );
-
-      const currentZoom = zoomRef.current;
-
+      blocksRef.current = blocksRef.current.map((block) => computeBlockRef.current(block));
       blocksRef.current.forEach((block, i) => {
         const node = nodesRef.current[i];
         if (!node) return;
-        node.style.transform = `translate(${block.x}px, ${block.y}px)`;
-        const dynamicSize = block.fontSize / currentZoom;
-        node.style.fontSize = `${dynamicSize}px`;
-
-        // 밀도 높은 블록 글로우
-        if (block.vibration > 1) {
-          const intensity = block.vibration * 2;
-          node.style.textShadow =
-            `0 0 ${intensity}px ${block.color}, 0 0 ${intensity * 2}px ${block.color}88`;
-        }
+        node.style.transform = `translate(${block.x - block.textWidth / 2}px, ${block.y - block.fontSize / 2}px)`;
+        node.style.fontSize = `${block.fontSize}px`;
       });
-
       rafRef.current = requestAnimationFrame(loop);
     };
+
     rafRef.current = requestAnimationFrame(loop);
-    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
   }, []);
 
-  // ── 이벤트 핸들러 ────────────────────────────────────
   const handleMouseMove = useCallback((e) => {
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const rawX    = e.clientX - rect.left;
-    const rawY    = e.clientY - rect.top;
-    const canvasX = (rawX - panRef.current.x) / zoomRef.current;
-    const canvasY = (rawY - panRef.current.y) / zoomRef.current;
-    updateMouse(canvasX, canvasY);
 
-    particleSysRef.current?.addTrail(rawX, rawY, zoomRef.current);
+    const rawX = e.clientX - rect.left;
+    const rawY = e.clientY - rect.top;
 
-    if (isPanningRef.current) {
-      const dx = rawX - lastPanRef.current.x;
-      const dy = rawY - lastPanRef.current.y;
-      lastPanRef.current = { x: rawX, y: rawY };
-      const next = { x: panRef.current.x + dx, y: panRef.current.y + dy };
-      panRef.current = next;
-      setPan(next);
+    if (overlayDragRef.current.active) {
+      const dx = e.clientX - overlayDragRef.current.startX;
+      const dy = e.clientY - overlayDragRef.current.startY;
+      overlayDragRef.current.dx = dx;
+      overlayDragRef.current.dy = dy;
+      overlayDragRef.current.moved = Math.hypot(dx, dy) > 2;
+      setOverlayTransform({ dx, dy });
     }
-  }, [updateMouse]);
+
+    updateMouse(rawX, rawY);
+    particleSysRef.current?.addTrail(rawX, rawY, zoomRef.current);
+  }, [setOverlayTransform, updateMouse]);
 
   const handleMouseDown = useCallback((e) => {
-    if (e.button === 1 || e.altKey) {
-      isPanningRef.current = true;
-      lastPanRef.current   = { x: e.clientX, y: e.clientY };
+    if (e.button !== 0) return;
+
+    overlayDragRef.current = {
+      active: true,
+      moved: false,
+      startX: e.clientX,
+      startY: e.clientY,
+      dx: 0,
+      dy: 0,
+    };
+  }, []);
+
+  const finishOverlayDrag = useCallback(() => {
+    if (!overlayDragRef.current.active) return;
+
+    const didMove = overlayDragRef.current.moved;
+    overlayDragRef.current.active = false;
+    overlayDragRef.current.dx = 0;
+    overlayDragRef.current.dy = 0;
+
+    if (didMove) {
+      skipNextClickRef.current = true;
+      requestAnimationFrame(() => syncMapOverlays());
+      setTimeout(() => syncMapOverlays(), 80);
+      setTimeout(() => syncMapOverlays(), 220);
+    } else {
+      setOverlayTransform();
     }
-  }, []);
+  }, [setOverlayTransform, syncMapOverlays]);
 
-  const handleMouseUp = useCallback(() => {
-    isPanningRef.current = false;
-  }, []);
-
-  const handleClick = useCallback((e) => {
-    if (isPanningRef.current) return;
+  const handleWheelCapture = useCallback((e) => {
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const cx = (e.clientX - rect.left - panRef.current.x) / zoomRef.current;
-    const cy = (e.clientY - rect.top  - panRef.current.y) / zoomRef.current;
 
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? 2 : -2;
+      runnersStore.setDensity(runnersStore.getDensity() + delta);
+      setDensityDisplay(runnersStore.getDensity());
+      clearTimeout(densityTimerRef.current);
+      densityTimerRef.current = setTimeout(() => setDensityDisplay(null), 1500);
+      return;
+    }
+
+    const originX = e.clientX - rect.left;
+    const originY = e.clientY - rect.top;
+    const scale = e.deltaY < 0 ? 2 : 0.5;
+
+    setOverlayTransform({ scale, originX, originY });
+    setTimeout(() => syncMapOverlays(), 90);
+    setTimeout(() => syncMapOverlays(), 220);
+    setTimeout(() => syncMapOverlays(), 420);
+  }, [setOverlayTransform, syncMapOverlays]);
+
+  const handleClick = useCallback((e) => {
+    if (skipNextClickRef.current) {
+      skipNextClickRef.current = false;
+      return;
+    }
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
     blocksRef.current = applyShockwaveRef.current(blocksRef.current, cx, cy);
 
-    const screenX = e.clientX - rect.left;
-    const screenY = e.clientY - rect.top;
-    const nearBlock = blocksRef.current.find((b) => {
-      const bx = b.x * zoomRef.current + panRef.current.x;
-      const by = b.y * zoomRef.current + panRef.current.y;
-      return Math.hypot(bx - screenX, by - screenY) < 60;
-    });
-    particleSysRef.current?.explodeAt(
-      screenX, screenY,
-      nearBlock?.text ?? "run",
-      nearBlock?.color ?? "#fff",
-      10
-    );
+    const near = blocksRef.current.find((b) => Math.hypot(b.x - cx, b.y - cy) < 60);
+    particleSysRef.current?.explodeAt(cx, cy, near?.text ?? "run", near?.color ?? "#fff", 10);
   }, []);
 
   const handleDblClick = useCallback(() => {
-    zoomRef.current = 1;
-    panRef.current  = { x: 0, y: 0 };
-    setZoom(1);
-    setPan({ x: 0, y: 0 });
-  }, []);
+    const map = kakaoMapRef.current;
+    if (map && runners[0]?.points[0] && window.kakao?.maps) {
+      const first = runners[0].points[0];
+      map.setCenter(new window.kakao.maps.LatLng(first.lat, first.lon));
+      map.setLevel(5);
+    }
+  }, [runners]);
 
   return (
     <div
       ref={containerRef}
       className="run-map"
-      onMouseMove={handleMouseMove}
-      onMouseDown={handleMouseDown}
-      onMouseUp={handleMouseUp}
+      onMouseDownCapture={handleMouseDown}
+      onMouseMoveCapture={handleMouseMove}
+      onMouseUpCapture={finishOverlayDrag}
+      onWheelCapture={handleWheelCapture}
+      onMouseLeave={finishOverlayDrag}
       onClick={handleClick}
       onDoubleClick={handleDblClick}
     >
-      <div
-        className="map-layer"
-        style={{
-          transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-          transformOrigin: "0 0",
-        }}
-      >
+      <div className="map-layer">
+        <div ref={mapRef} className="kakao-map-bg" />
         <canvas ref={routeCanvasRef} className="route-canvas" />
-        <canvas ref={animCanvasRef}  className="route-canvas" />
         <div ref={textLayerRef} className="text-layer" />
       </div>
 
       <canvas ref={particleCanvasRef} className="particle-canvas" />
 
-      {runners.length === 0 && (
-        <div className="empty-hint">
-          GPX 파일을 업로드하면<br />달린 경로가 이름으로 새겨집니다
+      <div className="runner-ranking">
+        <div className="runner-ranking-title">
+          TOP RUNNERS
+        </div>
+
+        {topRunners.map((runner, index) => (
+          <div
+            key={runner.id}
+            className="runner-ranking-item"
+            style={{
+              color: runner.color,
+            }}
+          >
+            <span className="runner-rank-number">
+              #{index + 1}
+            </span>
+
+            <span className="runner-rank-name">
+              {runner.name}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {densityDisplay !== null && (
+        <div className="density-indicator">
+          Text density {densityDisplay}px
+          <div className="density-hint">Ctrl + wheel</div>
         </div>
       )}
+
+      {runners.length === 0 && (
+        <div className="empty-hint">
+          Upload a GPX file.
+          <br />
+          Running routes will be filled with names.
+        </div>
+      )}
+
       {zoom !== 1 && (
         <div className="zoom-indicator">
-          {Math.round(zoom * 100)}% · 더블클릭으로 리셋
+          {Math.round(zoom * 100)}% - double click to reset
         </div>
       )}
     </div>

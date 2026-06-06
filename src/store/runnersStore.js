@@ -1,22 +1,15 @@
-/**
- * 전역 러너 상태 — 간단한 pub/sub 스토어
- * React 외부에서도 접근 가능하도록 별도 모듈로 분리
- */
-
 let runners = [];
+let fillDensity = 18; // 기본 텍스트 간격 (px)
 const listeners = new Set();
+const densityListeners = new Set();
 
-function notify() {
-  listeners.forEach((fn) => fn([...runners]));
-}
+function notify() { listeners.forEach((fn) => fn([...runners])); }
+function notifyDensity() { densityListeners.forEach((fn) => fn(fillDensity)); }
 
 export const runnersStore = {
-  getAll() {
-    return [...runners];
-  },
+  getAll() { return [...runners]; },
 
   add(runner) {
-    // 같은 id 중복 방지
     if (runners.find((r) => r.id === runner.id)) return;
     runners = [...runners, runner];
     notify();
@@ -27,13 +20,23 @@ export const runnersStore = {
     notify();
   },
 
-  clear() {
-    runners = [];
-    notify();
-  },
+  clear() { runners = []; notify(); },
 
   subscribe(fn) {
     listeners.add(fn);
-    return () => listeners.delete(fn); // unsubscribe
+    return () => listeners.delete(fn);
+  },
+
+  // 밀도 관련
+  getDensity() { return fillDensity; },
+
+  setDensity(val) {
+    fillDensity = Math.max(6, Math.min(60, val));
+    notifyDensity();
+  },
+
+  subscribeDensity(fn) {
+    densityListeners.add(fn);
+    return () => densityListeners.delete(fn);
   },
 };

@@ -1,11 +1,11 @@
 import {
   prepare,
-  layout,
   prepareWithSegments,
   measureLineStats,
 } from "@chenglou/pretext";
 
 const cache = new Map();
+const FONT_FAMILY = `"Pretendard", -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif`;
 
 function getPrep(text, font) {
   const key = `${text}||${font}`;
@@ -25,7 +25,7 @@ export function measureName(name, fontSize) {
     return { width: name.length * 8, height: 14 };
   }
 
-  const font = `${fontSize}px "Courier New", monospace`;
+  const font = `${fontSize}px ${FONT_FAMILY}`;
   try {
     const prep = getPrepSeg(name, font);
     const { maxLineWidth } = measureLineStats(prep, 9999);
@@ -52,12 +52,14 @@ export function warmupNames(names, fontSizes = [8, 10, 12, 14, 16, 20, 24, 32, 4
   let count = 0;
   for (const name of names) {
     for (const size of fontSizes) {
-      const font = `${size}px "Courier New", monospace`;
+      const font = `${size}px ${FONT_FAMILY}`;
       try {
         getPrep(name, font);
         getPrepSeg(name, font);
         count++;
-      } catch {}
+      } catch {
+        // Ignore font warmup failures and fall back to on-demand measurement.
+      }
     }
   }
   console.log(`[Pretext] warmup: ${count}개 캐시`);

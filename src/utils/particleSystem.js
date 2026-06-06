@@ -105,7 +105,7 @@ export class ParticleSystem {
       ctx.rotate(p.rotation);
       ctx.globalAlpha = p.alpha;
       ctx.fillStyle = p.color;
-      ctx.font = `${p.size}px "Courier New", monospace`;
+      ctx.font = `${p.size}px "Pretendard", system-ui, sans-serif`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.fillText(p.char, 0, 0);
